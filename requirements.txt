@@ -2,6 +2,7 @@ numpy
 pandas
 sentence-transformers
 faiss-cpu
+pyarrow
 transformers
 streamlit
 openai

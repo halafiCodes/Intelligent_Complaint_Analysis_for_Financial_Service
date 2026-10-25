@@ -9,6 +9,11 @@ data/
 logs/
 .ipynb_checkpoints/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
 
 # Streamlit secrets (do NOT commit API keys)
 .streamlit/secrets.toml

@@ -126,12 +126,12 @@ def _is_quota_error(exc: Exception) -> bool:
 def load_embedding_model(model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
     """Returns an embedding model with an .encode() method, or None for offline keyword-only mode.
 
-    Default backend is OpenAI (requires OPENAI_API_KEY). You can override with:
+    Default backend is local sentence-transformers. You can override with:
     - RAG_EMBEDDINGS_BACKEND=openai|sentence-transformers
     - RAG_EMBEDDING_MODEL=text-embedding-3-small
     """
 
-    backend = os.environ.get("RAG_EMBEDDINGS_BACKEND", "openai").strip().lower()
+    backend = os.environ.get("RAG_EMBEDDINGS_BACKEND", "sentence-transformers").strip().lower()
 
     if backend in {"openai", "oai"}:
         api_key = os.environ.get("OPENAI_API_KEY")

@@ -12,7 +12,7 @@ from openai import OpenAI
 BASE_DIR = Path(__file__).resolve().parent
 FAISS_PATH = BASE_DIR / "vector_store" / "faiss_index.bin"
 METADATA_PATH = BASE_DIR / "vector_store" / "metadata.pkl"
-EMBEDDING_MODEL = "text-embedding-3-small"
+EMBEDDING_MODEL = os.getenv("RAG_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 TOP_K = 5
 
 
@@ -25,25 +25,39 @@ def get_openai_client() -> OpenAI:
     api_key = api_key or os.getenv("OPENAI_API_KEY")
 
     if not api_key:
-        st.error(
-            "Missing OPENAI_API_KEY.\n\n"
-            "Fix option A (recommended): set an environment variable named OPENAI_API_KEY.\n"
-            "Fix option B: create .streamlit/secrets.toml with:\n\n"
-            "OPENAI_API_KEY = \"your_key_here\"\n"
-        )
-        st.stop()
+        raise RuntimeError("OPENAI_API_KEY is not configured")
 
     return OpenAI(api_key=api_key)
 
 
-def embed_texts_openai(texts: list[str]) -> np.ndarray:
-    client = get_openai_client()
-    response = client.embeddings.create(
-        model=EMBEDDING_MODEL,
-        input=texts,
-    )
-    vectors = [item.embedding for item in response.data]
+@st.cache_resource
+def load_embedding_model():
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError as exc:
+        raise RuntimeError(
+            "sentence-transformers is required for local retrieval. Install requirements.txt."
+        ) from exc
+    return SentenceTransformer(EMBEDDING_MODEL)
+
+
+def embed_texts_local(texts: list[str]) -> np.ndarray:
+    model = load_embedding_model()
+    vectors = model.encode(texts, convert_to_numpy=True, normalize_embeddings=False)
     return np.asarray(vectors, dtype=np.float32)
+
+
+def _chunk_text(item: dict) -> str:
+    if "chunk_text" in item:
+        return str(item["chunk_text"] or "")
+    return str(item.get("text") or "")
+
+
+def _metadata_value(item: dict, key: str):
+    if key in item:
+        return item[key]
+    nested = item.get("metadata")
+    return nested.get(key) if isinstance(nested, dict) else None
 
 
 def _tokenize(text: str) -> list[str]:
@@ -68,7 +82,7 @@ def _metadata_token_cache(metadata: list[dict]) -> list[set[str]]:
     for item in metadata:
         chunk = ""
         if isinstance(item, dict):
-            chunk = str(item.get("chunk_text", ""))
+            chunk = _chunk_text(item)
         cached.append(set(_tokenize(chunk)))
     return cached
 
@@ -125,12 +139,12 @@ except Exception as exc:
 
 def retrieve(query):
     try:
-        query_embedding = embed_texts_openai([query])
+        query_embedding = embed_texts_local([query])
         index_dim = int(getattr(index, "d", 0))
         if index_dim and int(query_embedding.shape[1]) != index_dim:
             raise RuntimeError(
                 f"Embedding dimension mismatch: FAISS index dim={index_dim} but '{EMBEDDING_MODEL}' returned dim={int(query_embedding.shape[1])}. "
-                "Rebuild the vector store using the same embedding model as the app (run: python src/build_vector_store.py)."
+                "Rebuild the vector store using the same embedding model as the app."
             )
 
         _distances, indices = index.search(query_embedding, TOP_K)
@@ -143,20 +157,15 @@ def retrieve(query):
                 results.append(metadata[idx])
         return results
     except Exception as exc:
-        if _is_quota_error(exc):
-            st.warning(
-                "OpenAI quota is unavailable (HTTP 429 / insufficient_quota). "
-                "Falling back to offline keyword search for retrieval."
-            )
-            return keyword_retrieve(query, top_k=TOP_K)
-        raise
+        st.warning(f"Semantic retrieval unavailable ({exc}). Falling back to keyword search.")
+        return keyword_retrieve(query, top_k=TOP_K)
 
 
 def generate_answer(query, retrieved_chunks):
     if not retrieved_chunks:
         return "I don't have enough information in the indexed complaints to answer that question."
 
-    context = "\n\n".join([c["chunk_text"] for c in retrieved_chunks])
+    context = "\n\n".join(_chunk_text(c) for c in retrieved_chunks)
 
     prompt = f"""
 You are a financial complaint analyst.
@@ -179,12 +188,9 @@ Question:
         )
         return response.choices[0].message.content
     except Exception as exc:
-        if _is_quota_error(exc):
-            st.warning(
-                "OpenAI quota is unavailable (HTTP 429 / insufficient_quota). "
-                "Showing an extractive answer from the most relevant complaint excerpts instead."
-            )
-            return "\n\n".join([c.get("chunk_text", "") for c in retrieved_chunks])
+        if _is_quota_error(exc) or isinstance(exc, RuntimeError):
+            st.warning("OpenAI generation is unavailable. Showing the retrieved complaint excerpts instead.")
+            return "\n\n".join(_chunk_text(c) for c in retrieved_chunks)
         raise
 
 
@@ -223,5 +229,5 @@ for q, a, sources in reversed(st.session_state.history):
 
     st.markdown("### 📚 Sources Used")
     for i, src in enumerate(sources):
-        with st.expander(f"Source {i+1} - {src['product']}"):
-            st.write(src["chunk_text"])
+        with st.expander(f"Source {i+1} - {_metadata_value(src, 'product') or 'Unknown product'}"):
+            st.write(_chunk_text(src))

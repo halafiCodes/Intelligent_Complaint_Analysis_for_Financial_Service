@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import pickle
 from pathlib import Path
 
@@ -79,14 +80,12 @@ def create_documents(
         for chunk_id, chunk in enumerate(chunks):
             documents.append(
                 {
-                    "text": chunk,
-                    "metadata": {
-                        "complaint_id": int(idx),
-                        "product": row.get("Product"),
-                        "company": row.get("Company"),
-                        "state": row.get("State"),
-                        "chunk_id": int(chunk_id),
-                    },
+                    "chunk_text": chunk,
+                    "complaint_id": int(idx),
+                    "product": row.get("Product"),
+                    "company": row.get("Company"),
+                    "state": row.get("State"),
+                    "chunk_id": int(chunk_id),
                 }
             )
 
@@ -135,10 +134,72 @@ def detect_text_column(df: pd.DataFrame) -> str:
     )
 
 
-def main() -> None:
+def build_from_parquet(parquet_path: Path, out_dir: Path, batch_size: int = 10_000) -> None:
+    try:
+        import faiss  # pyright: ignore[reportMissingImports]
+        import pyarrow.parquet as pq  # pyright: ignore[reportMissingImports]
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError("Parquet builds require pyarrow and faiss-cpu.") from exc
+
+    if not parquet_path.exists():
+        raise FileNotFoundError(f"Parquet input not found: {parquet_path}")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be > 0")
+
+    parquet_file = pq.ParquetFile(parquet_path)
+    required_columns = {"document", "embedding", "metadata"}
+    available_columns = set(parquet_file.schema_arrow.names)
+    missing_columns = required_columns - available_columns
+    if missing_columns:
+        raise ValueError(f"Parquet input is missing columns: {sorted(missing_columns)}")
+
+    index = None
+    metadata: list[dict] = []
+    total_rows = 0
+    for batch in parquet_file.iter_batches(
+        batch_size=batch_size,
+        columns=["document", "embedding", "metadata"],
+    ):
+        rows = batch.to_pylist()
+        embeddings = np.asarray([row["embedding"] for row in rows], dtype=np.float32)
+        if embeddings.ndim != 2 or embeddings.shape[0] == 0:
+            continue
+        if index is None:
+            index = faiss.IndexFlatL2(int(embeddings.shape[1]))
+        elif int(embeddings.shape[1]) != int(index.d):
+            raise ValueError("Parquet embeddings have inconsistent dimensions")
+        index.add(embeddings)
+
+        for row in rows:
+            item_metadata = row["metadata"] or {}
+            metadata.append(
+                {
+                    "chunk_text": str(row["document"] or ""),
+                    "complaint_id": item_metadata.get("complaint_id"),
+                    "product": item_metadata.get("product"),
+                    "company": item_metadata.get("company"),
+                    "state": item_metadata.get("state"),
+                    "chunk_id": item_metadata.get("chunk_index"),
+                }
+            )
+        total_rows += len(rows)
+        print(f"Processed {total_rows:,} rows")
+
+    if index is None or index.ntotal == 0:
+        raise ValueError("Parquet input contains no embeddings")
+    if len(metadata) != int(index.ntotal):
+        raise ValueError("Generated metadata count does not match FAISS index count")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    faiss.write_index(index, str(out_dir / "faiss_index.bin"))
+    with open(out_dir / "metadata.pkl", "wb") as f:
+        pickle.dump(metadata, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"Saved index to: {out_dir / 'faiss_index.bin'}")
+    print(f"Saved metadata to: {out_dir / 'metadata.pkl'}")
+
+
+def build_from_csv(data_path: Path, out_dir: Path) -> None:
     root = repo_root()
-    data_path = root / "data" / "processed" / "filtered_complaints.csv"
-    out_dir = root / "vector_store"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if not data_path.exists():
@@ -163,19 +224,37 @@ def main() -> None:
             "Check that the complaint text column is non-empty and contains strings."
         )
 
-    texts = [doc["text"] for doc in documents]
+    texts = [doc["chunk_text"] for doc in documents]
     embeddings = generate_embeddings(texts)
 
     index, faiss = build_faiss_index(embeddings)
     faiss.write_index(index, str(out_dir / "faiss_index.bin"))
 
-    metadata = [doc["metadata"] for doc in documents]
+    metadata = documents
     with open(out_dir / "metadata.pkl", "wb") as f:
         pickle.dump(metadata, f)
 
     print(f"Saved index to: {out_dir / 'faiss_index.bin'}")
     print(f"Saved metadata to: {out_dir / 'metadata.pkl'}")
     print("Vector store built successfully.")
+
+
+def main() -> None:
+    root = repo_root()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--parquet", type=Path, help="Use precomputed embeddings from a Parquet file")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=10_000,
+        help="Rows loaded per Parquet batch",
+    )
+    args = parser.parse_args()
+
+    if args.parquet:
+        build_from_parquet(args.parquet, root / "vector_store", args.batch_size)
+    else:
+        build_from_csv(root / "data" / "processed" / "filtered_complaints.csv", root / "vector_store")
 
 
 if __name__ == "__main__":
