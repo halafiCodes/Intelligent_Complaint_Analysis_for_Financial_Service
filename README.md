@@ -64,7 +64,15 @@ Input expected at:
 
 - `data/processed/filtered_complaints.csv`
 
-Then run:
+For the supplied precomputed embeddings file, run:
+
+```powershell
+python src/build_vector_store.py --parquet "C:\Users\weldi\Downloads\complaint_embeddings-001.parquet"
+```
+
+This streams the Parquet file and does not require extracting the 6 GB CSV archive. The generated index uses 384-dimensional `all-MiniLM-L6-v2` vectors, and the app uses the same model for query embeddings.
+
+To build from a processed CSV instead, run:
 
 ```powershell
 python src/build_vector_store.py
@@ -96,7 +104,7 @@ If OpenAI returns `429 insufficient_quota` (no credit/billing/quota), the app is
 - Retrieval falls back to **offline keyword search** (no embeddings call)
 - Answer falls back to an **extractive response** (shows the most relevant excerpts)
 
-Note: building a fresh vector store still requires embeddings. If you don’t have OpenAI quota, you’ll need either an existing `vector_store/` already built, or to swap embeddings to another provider.
+Note: retrieval uses local sentence-transformers embeddings. OpenAI is only used to generate answers; without a key or quota, the app shows the retrieved complaint excerpts instead.
 
 ## Tests
 
